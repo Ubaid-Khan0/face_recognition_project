@@ -21,19 +21,6 @@ from whatsapp_api_client_python import API
 
 CAMERA_INDEX = 0
 
-# ------------------------------------------------------------
-# SYSTEM MODE
-# ------------------------------------------------------------
-# Change this depending on which camera/gate is running.
-#
-# "ENTRY" = student entering school
-# "EXIT"  = student leaving school
-#
-# Later, you can have separate computers/cameras for both.
-# ------------------------------------------------------------
-
-MODE = "ENTRY"
-
 
 # ------------------------------------------------------------
 # FACE RECOGNITION
@@ -45,18 +32,18 @@ DETECTOR_BACKEND = "opencv"
 
 DISTANCE_METRIC = "cosine"
 
-# Lower = stricter
+# Lower value = stricter recognition
 FACE_DISTANCE_THRESHOLD = 0.45
 
-# Run DeepFace approximately every X seconds
+# Run face recognition every X seconds
 RECOGNITION_INTERVAL = 1.0
 
-# Prevent repeated attendance records/messages
+# Prevent duplicate attendance
 COOLDOWN_SECONDS = 60
 
 
 # ------------------------------------------------------------
-# KNOWN FACE DIRECTORY
+# KNOWN FACES
 # ------------------------------------------------------------
 
 PICS_DIR = "known_faces"
@@ -73,27 +60,27 @@ DATABASE_FILE = "attendance.db"
 
 
 # ------------------------------------------------------------
-# GREEN API
+# WHATSAPP / GREEN API
 # ------------------------------------------------------------
+
 # IMPORTANT:
-# Generate a NEW token after the token you previously posted
-# publicly.
-# ------------------------------------------------------------
+# Replace these with your NEW Green API credentials.
 
 ID_INSTANCE = "710722742243"
 
 API_TOKEN_INSTANCE = "6f726ee34e92495fbfe5170f01f4d530b3cd38138b224d068f"
 
 # Example:
+# Pakistani number:
 # 03001234567
 #
-# becomes:
+# Green API format:
 # 923001234567@c.us
 
 RECIPIENT_PHONE = "923397070799@c.us"
 
 
-# Green API client
+# Create Green API client
 green_api = API.GreenApi(
     ID_INSTANCE,
     API_TOKEN_INSTANCE
@@ -128,7 +115,7 @@ initialize_database()
 
 
 # ============================================================
-# WHATSAPP
+# WHATSAPP MESSAGE
 # ============================================================
 
 def send_whatsapp_alert(student_name, action):
@@ -147,7 +134,7 @@ def send_whatsapp_alert(student_name, action):
             f"📌 *Action:* {action}\n"
             f"📅 *Date:* {date_str}\n"
             f"⏰ *Time:* {time_str}\n\n"
-            "🤖 AI Face Recognition System"
+            "🤖 AI Face Recognition Attendance System"
         )
 
         try:
@@ -177,7 +164,8 @@ def send_whatsapp_alert(student_name, action):
                 f"[WHATSAPP ERROR] {error}"
             )
 
-    # Run WhatsApp request in background
+    # Run WhatsApp in background
+    # so camera does not freeze
     threading.Thread(
         target=send_request,
         daemon=True
@@ -185,7 +173,7 @@ def send_whatsapp_alert(student_name, action):
 
 
 # ============================================================
-# DATABASE ATTENDANCE
+# SAVE ATTENDANCE
 # ============================================================
 
 def save_attendance(student_name, action):
@@ -241,7 +229,7 @@ def save_attendance(student_name, action):
 
 
 # ============================================================
-# LOAD KNOWN FACES
+# LOAD KNOWN FACE IMAGES
 # ============================================================
 
 def get_known_face_images():
@@ -308,8 +296,8 @@ def match_face_with_deepface(frame):
 
 
     print(
-        f"[INFO] Checking {len(known_faces)} "
-        f"known face image(s)..."
+        f"[INFO] Checking "
+        f"{len(known_faces)} known face image(s)..."
     )
 
 
@@ -393,11 +381,16 @@ class FaceAttendanceApp:
         self.window = window
 
         self.window.title(
-            "AI School Attendance System"
+            "AI School Entry / Exit Attendance System"
         )
 
         self.window.geometry(
-            "1000x750"
+            "1000x800"
+        )
+
+        self.window.protocol(
+            "WM_DELETE_WINDOW",
+            self.quit_app
         )
 
 
@@ -421,17 +414,69 @@ class FaceAttendanceApp:
 
         self.last_attendance_time = 0
 
+        # Current mode
+        self.mode = "ENTRY"
+
 
         # ----------------------------------------------------
-        # CAMERA LABEL
+        # TITLE
         # ----------------------------------------------------
 
-        self.cam_label = tk.Label(
+        self.title_label = tk.Label(
+            self.window,
+            text="AI SCHOOL ATTENDANCE SYSTEM",
+            font=("Arial", 24, "bold")
+        )
+
+        self.title_label.pack(
+            pady=10
+        )
+
+
+        # ----------------------------------------------------
+        # MODE BUTTON FRAME
+        # ----------------------------------------------------
+
+        self.mode_frame = tk.Frame(
             self.window
         )
 
-        self.cam_label.pack(
-            pady=10
+        self.mode_frame.pack(
+            pady=5
+        )
+
+
+        # ENTRY BUTTON
+        self.entry_button = tk.Button(
+            self.mode_frame,
+            text="ENTRY",
+            font=("Arial", 16, "bold"),
+            width=12,
+            height=2,
+            command=self.set_entry_mode
+        )
+
+        self.entry_button.grid(
+            row=0,
+            column=0,
+            padx=10
+        )
+
+
+        # EXIT BUTTON
+        self.exit_button = tk.Button(
+            self.mode_frame,
+            text="EXIT",
+            font=("Arial", 16, "bold"),
+            width=12,
+            height=2,
+            command=self.set_exit_mode
+        )
+
+        self.exit_button.grid(
+            row=0,
+            column=1,
+            padx=10
         )
 
 
@@ -441,12 +486,12 @@ class FaceAttendanceApp:
 
         self.mode_label = tk.Label(
             self.window,
-            text=f"MODE: {MODE}",
-            font=("Arial", 18, "bold")
+            text="MODE: ENTRY",
+            font=("Arial", 20, "bold")
         )
 
         self.mode_label.pack(
-            pady=5
+            pady=8
         )
 
 
@@ -476,18 +521,31 @@ class FaceAttendanceApp:
         )
 
         self.result_label.pack(
+            pady=8
+        )
+
+
+        # ----------------------------------------------------
+        # CAMERA
+        # ----------------------------------------------------
+
+        self.cam_label = tk.Label(
+            self.window
+        )
+
+        self.cam_label.pack(
             pady=10
         )
 
 
         # ----------------------------------------------------
-        # QUIT BUTTON ONLY
+        # QUIT BUTTON
         # ----------------------------------------------------
 
         self.quit_button = tk.Button(
             self.window,
             text="QUIT",
-            font=("Arial", 12, "bold"),
+            font=("Arial", 14, "bold"),
             width=12,
             command=self.quit_app
         )
@@ -498,10 +556,104 @@ class FaceAttendanceApp:
 
 
         # ----------------------------------------------------
+        # SET INITIAL BUTTON STATE
+        # ----------------------------------------------------
+
+        self.update_mode_buttons()
+
+
+        # ----------------------------------------------------
         # START CAMERA
         # ----------------------------------------------------
 
         self.update_video()
+
+
+    # ========================================================
+    # SET ENTRY MODE
+    # ========================================================
+
+    def set_entry_mode(self):
+
+        self.mode = "ENTRY"
+
+        self.last_student = None
+        self.last_attendance_time = 0
+
+        self.update_mode_buttons()
+
+        self.status_label.config(
+            text="Status: Entry mode activated"
+        )
+
+        self.result_label.config(
+            text="Student: Unknown"
+        )
+
+        print(
+            "[MODE] ENTRY mode activated"
+        )
+
+
+    # ========================================================
+    # SET EXIT MODE
+    # ========================================================
+
+    def set_exit_mode(self):
+
+        self.mode = "EXIT"
+
+        self.last_student = None
+        self.last_attendance_time = 0
+
+        self.update_mode_buttons()
+
+        self.status_label.config(
+            text="Status: Exit mode activated"
+        )
+
+        self.result_label.config(
+            text="Student: Unknown"
+        )
+
+        print(
+            "[MODE] EXIT mode activated"
+        )
+
+
+    # ========================================================
+    # UPDATE BUTTON APPEARANCE
+    # ========================================================
+
+    def update_mode_buttons(self):
+
+        if self.mode == "ENTRY":
+
+            self.entry_button.config(
+                relief=tk.SUNKEN
+            )
+
+            self.exit_button.config(
+                relief=tk.RAISED
+            )
+
+            self.mode_label.config(
+                text="MODE: ENTRY"
+            )
+
+        else:
+
+            self.entry_button.config(
+                relief=tk.RAISED
+            )
+
+            self.exit_button.config(
+                relief=tk.SUNKEN
+            )
+
+            self.mode_label.config(
+                text="MODE: EXIT"
+            )
 
 
     # ========================================================
@@ -519,7 +671,7 @@ class FaceAttendanceApp:
 
 
             # ------------------------------------------------
-            # FACE DETECTION FOR DISPLAY
+            # FACE DETECTION
             # ------------------------------------------------
 
             gray = cv2.cvtColor(
@@ -542,7 +694,7 @@ class FaceAttendanceApp:
 
 
             # ------------------------------------------------
-            # DRAW FACE BOX
+            # DRAW FACE BOXES
             # ------------------------------------------------
 
             for (
@@ -604,6 +756,29 @@ class FaceAttendanceApp:
 
 
             # ------------------------------------------------
+            # SHOW MODE ON CAMERA
+            # ------------------------------------------------
+
+            cv2.putText(
+
+                frame,
+
+                f"MODE: {self.mode}",
+
+                (20, 40),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                1,
+
+                (255, 255, 0),
+
+                2
+
+            )
+
+
+            # ------------------------------------------------
             # RECOGNITION TIMER
             # ------------------------------------------------
 
@@ -633,10 +808,7 @@ class FaceAttendanceApp:
 
                 self.last_recognition_time = current_time
 
-
-                frame_copy = (
-                    self.current_frame.copy()
-                )
+                frame_copy = self.current_frame.copy()
 
 
                 threading.Thread(
@@ -704,6 +876,14 @@ class FaceAttendanceApp:
             )
 
 
+        else:
+
+            self.status_label.config(
+                text="Camera error"
+            )
+
+
+        # Keep updating camera
         self.window.after(
             20,
             self.update_video
@@ -762,13 +942,14 @@ class FaceAttendanceApp:
 
 
         # ----------------------------------------------------
-        # PREVENT DUPLICATE ATTENDANCE
+        # PREVENT DUPLICATES
         # ----------------------------------------------------
 
         if (
 
             self.last_student
-            == student_name
+            ==
+            student_name
 
             and
 
@@ -800,10 +981,10 @@ class FaceAttendanceApp:
 
 
         # ----------------------------------------------------
-        # ACTION
+        # CREATE ACTION
         # ----------------------------------------------------
 
-        if MODE.upper() == "ENTRY":
+        if self.mode == "ENTRY":
 
             action = "ENTERED SCHOOL"
 
@@ -812,6 +993,10 @@ class FaceAttendanceApp:
             action = "LEFT SCHOOL"
 
 
+        # ----------------------------------------------------
+        # PRINT RESULT
+        # ----------------------------------------------------
+
         print(
             "===================================="
         )
@@ -819,6 +1004,11 @@ class FaceAttendanceApp:
         print(
             f"[ATTENDANCE] "
             f"{student_name}"
+        )
+
+        print(
+            f"[MODE] "
+            f"{self.mode}"
         )
 
         print(
@@ -851,8 +1041,46 @@ class FaceAttendanceApp:
         )
 
 
+        # ----------------------------------------------------
+        # UPDATE GUI
+        # ----------------------------------------------------
+
+        self.window.after(
+            0,
+            lambda: self.show_success(
+                student_name,
+                action
+            )
+        )
+
+
     # ========================================================
-    # QUIT
+    # SHOW SUCCESS MESSAGE
+    # ========================================================
+
+    def show_success(
+        self,
+        student_name,
+        action
+    ):
+
+        self.result_label.config(
+            text=(
+                f"{student_name}\n"
+                f"{action}"
+            )
+        )
+
+        self.status_label.config(
+            text=(
+                "Attendance recorded + "
+                "WhatsApp notification sent"
+            )
+        )
+
+
+    # ========================================================
+    # QUIT APPLICATION
     # ========================================================
 
     def quit_app(self):
@@ -894,15 +1122,11 @@ if __name__ == "__main__":
     )
 
     print(
-        " AI SCHOOL ATTENDANCE SYSTEM"
+        " AI SCHOOL ENTRY / EXIT ATTENDANCE"
     )
 
     print(
         "========================================"
-    )
-
-    print(
-        f"MODE: {MODE}"
     )
 
     print(
@@ -911,6 +1135,14 @@ if __name__ == "__main__":
 
     print(
         f"THRESHOLD: {FACE_DISTANCE_THRESHOLD}"
+    )
+
+    print(
+        "ENTRY / EXIT BUTTONS ENABLED"
+    )
+
+    print(
+        "WHATSAPP NOTIFICATIONS ENABLED"
     )
 
     print(
