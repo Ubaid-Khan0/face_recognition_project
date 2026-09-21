@@ -1,876 +1,929 @@
+import cv2
 import os
 import time
 import sqlite3
-from datetime import datetime
+import threading
+import datetime
+import tkinter as tk
 
-import cv2
+from PIL import Image, ImageTk
 from deepface import DeepFace
-from ultralytics import YOLO
+from whatsapp_api_client_python import API
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# ------------------------------------------------------------
+# CAMERA
+# ------------------------------------------------------------
 
 CAMERA_INDEX = 0
 
-KNOWN_FACES_DIR = os.path.join(BASE_DIR, "known_faces")
-DATABASE_FILE = os.path.join(BASE_DIR, "attendance.db")
+# ------------------------------------------------------------
+# SYSTEM MODE
+# ------------------------------------------------------------
+# Change this depending on which camera/gate is running.
+#
+# "ENTRY" = student entering school
+# "EXIT"  = student leaving school
+#
+# Later, you can have separate computers/cameras for both.
+# ------------------------------------------------------------
 
-# YOLO11 nano
-YOLO_MODEL = os.path.join(BASE_DIR, "yolo11n.pt")
+MODE = "ENTRY"
 
-# Run face recognition once every second
+
+# ------------------------------------------------------------
+# FACE RECOGNITION
+# ------------------------------------------------------------
+
+MODEL_NAME = "Facenet"
+
+DETECTOR_BACKEND = "opencv"
+
+DISTANCE_METRIC = "cosine"
+
+# Lower = stricter
+FACE_DISTANCE_THRESHOLD = 0.45
+
+# Run DeepFace approximately every X seconds
 RECOGNITION_INTERVAL = 1.0
 
-# DeepFace model
-FACE_MODEL = "Facenet512"
-
-# Detector used by DeepFace
-# opencv is fast and works well for this webcam pipeline.
-FACE_DETECTOR = "opencv"
-
-# Used as an additional safety threshold.
-# DeepFace's verified result is also required.
-FACE_DISTANCE_THRESHOLD = 0.40
-
-# Prevent the same recognized student from triggering the database
-# action repeatedly.
-ATTENDANCE_ACTION_COOLDOWN_SECONDS = 60
-
-# YOLO confidence for person detection
-YOLO_CONFIDENCE = 0.45
+# Prevent repeated attendance records/messages
+COOLDOWN_SECONDS = 60
 
 
-# ============================================================
+# ------------------------------------------------------------
+# KNOWN FACE DIRECTORY
+# ------------------------------------------------------------
+
+PICS_DIR = "known_faces"
+
+if not os.path.exists(PICS_DIR):
+    os.makedirs(PICS_DIR)
+
+
+# ------------------------------------------------------------
 # DATABASE
+# ------------------------------------------------------------
+
+DATABASE_FILE = "attendance.db"
+
+
+# ------------------------------------------------------------
+# GREEN API
+# ------------------------------------------------------------
+# IMPORTANT:
+# Generate a NEW token after the token you previously posted
+# publicly.
+# ------------------------------------------------------------
+
+ID_INSTANCE = "710722742243"
+
+API_TOKEN_INSTANCE = "6f726ee34e92495fbfe5170f01f4d530b3cd38138b224d068f"
+
+# Example:
+# 03001234567
+#
+# becomes:
+# 923001234567@c.us
+
+RECIPIENT_PHONE = "923397070799@c.us"
+
+
+# Green API client
+green_api = API.GreenApi(
+    ID_INSTANCE,
+    API_TOKEN_INSTANCE
+)
+
+
+# ============================================================
+# DATABASE SETUP
 # ============================================================
 
-def create_database():
+def initialize_database():
+
     connection = sqlite3.connect(DATABASE_FILE)
+
     cursor = connection.cursor()
 
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS attendance_sessions (
+        CREATE TABLE IF NOT EXISTS attendance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             student_name TEXT NOT NULL,
-            attendance_date TEXT NOT NULL,
-            check_in TEXT NOT NULL,
-            check_out TEXT,
-            created_at TEXT NOT NULL,
-            legacy_attendance_id INTEGER UNIQUE
+            action TEXT NOT NULL,
+            date TEXT NOT NULL,
+            time TEXT NOT NULL
         )
     """)
 
-    # Preserve records from an older attendance table if one exists.
-    cursor.execute("""
-        SELECT name FROM sqlite_master
-        WHERE type = 'table' AND name = 'attendance'
-    """)
+    connection.commit()
+    connection.close()
 
-    if cursor.fetchone():
-        cursor.execute("""
-            INSERT OR IGNORE INTO attendance_sessions
+
+initialize_database()
+
+
+# ============================================================
+# WHATSAPP
+# ============================================================
+
+def send_whatsapp_alert(student_name, action):
+
+    def send_request():
+
+        current_time = datetime.datetime.now()
+
+        date_str = current_time.strftime("%d-%m-%Y")
+
+        time_str = current_time.strftime("%I:%M:%S %p")
+
+        message = (
+            "🔔 *School Attendance Alert*\n\n"
+            f"👤 *Student:* {student_name}\n"
+            f"📌 *Action:* {action}\n"
+            f"📅 *Date:* {date_str}\n"
+            f"⏰ *Time:* {time_str}\n\n"
+            "🤖 AI Face Recognition System"
+        )
+
+        try:
+
+            response = green_api.sending.sendMessage(
+                RECIPIENT_PHONE,
+                message
+            )
+
+            if response.code == 200:
+
+                print(
+                    f"[WHATSAPP SUCCESS] "
+                    f"{student_name} - {action}"
+                )
+
+            else:
+
+                print(
+                    f"[WHATSAPP ERROR] "
+                    f"Status Code: {response.code}"
+                )
+
+        except Exception as error:
+
+            print(
+                f"[WHATSAPP ERROR] {error}"
+            )
+
+    # Run WhatsApp request in background
+    threading.Thread(
+        target=send_request,
+        daemon=True
+    ).start()
+
+
+# ============================================================
+# DATABASE ATTENDANCE
+# ============================================================
+
+def save_attendance(student_name, action):
+
+    current_time = datetime.datetime.now()
+
+    date_str = current_time.strftime("%Y-%m-%d")
+
+    time_str = current_time.strftime("%H:%M:%S")
+
+    try:
+
+        connection = sqlite3.connect(
+            DATABASE_FILE
+        )
+
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO attendance
             (
                 student_name,
-                attendance_date,
-                check_in,
-                check_out,
-                created_at,
-                legacy_attendance_id
+                action,
+                date,
+                time
             )
-            SELECT
+            VALUES (?, ?, ?, ?)
+            """,
+            (
                 student_name,
-                attendance_date,
-                check_in,
-                check_out,
-                created_at,
-                id
-            FROM attendance
-            WHERE check_in IS NOT NULL
-        """)
-
-    connection.commit()
-    connection.close()
-
-
-# ============================================================
-# CHECK-IN
-# ============================================================
-
-def check_in(student_name):
-    now = datetime.now()
-
-    date_text = now.strftime("%Y-%m-%d")
-    time_text = now.strftime("%H:%M:%S")
-
-    connection = sqlite3.connect(DATABASE_FILE)
-    cursor = connection.cursor()
-
-    # Do not create another active check-in for the same student.
-    cursor.execute("""
-        SELECT id
-        FROM attendance_sessions
-        WHERE student_name = ?
-          AND attendance_date = ?
-          AND check_out IS NULL
-        ORDER BY id DESC
-        LIMIT 1
-    """, (student_name, date_text))
-
-    record = cursor.fetchone()
-
-    if record:
-        connection.close()
-        return False, f"{student_name} is already checked in. Check out first."
-
-    cursor.execute("""
-        INSERT INTO attendance_sessions
-        (
-            student_name,
-            attendance_date,
-            check_in,
-            check_out,
-            created_at
+                action,
+                date_str,
+                time_str
+            )
         )
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        student_name,
-        date_text,
-        time_text,
-        None,
-        now.isoformat()
-    ))
 
-    connection.commit()
-    connection.close()
+        connection.commit()
 
-    return True, f"{student_name} CHECK-IN successful at {time_text}"
-
-
-# ============================================================
-# CHECK-OUT
-# ============================================================
-
-def check_out(student_name):
-    now = datetime.now()
-
-    date_text = now.strftime("%Y-%m-%d")
-    time_text = now.strftime("%H:%M:%S")
-
-    connection = sqlite3.connect(DATABASE_FILE)
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        SELECT id, check_in
-        FROM attendance_sessions
-        WHERE student_name = ?
-          AND attendance_date = ?
-          AND check_out IS NULL
-        ORDER BY id DESC
-        LIMIT 1
-    """, (student_name, date_text))
-
-    record = cursor.fetchone()
-
-    if not record:
         connection.close()
-        return False, f"{student_name} has no active check-in today."
 
-    cursor.execute("""
-        UPDATE attendance_sessions
-        SET check_out = ?
-        WHERE id = ?
-    """, (time_text, record[0]))
+        print(
+            f"[DATABASE] "
+            f"{student_name} - {action} "
+            f"{date_str} {time_str}"
+        )
 
-    connection.commit()
-    connection.close()
+    except Exception as error:
 
-    return True, f"{student_name} CHECK-OUT successful at {time_text}"
-
-
-# ============================================================
-# GET TODAY'S ATTENDANCE
-# ============================================================
-
-def get_today_attendance():
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    connection = sqlite3.connect(DATABASE_FILE)
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        SELECT
-            student_name,
-            attendance_date,
-            check_in,
-            check_out
-        FROM attendance_sessions
-        WHERE attendance_date = ?
-        ORDER BY check_in
-    """, (today,))
-
-    records = cursor.fetchall()
-    connection.close()
-
-    return records
+        print(
+            f"[DATABASE ERROR] {error}"
+        )
 
 
 # ============================================================
-# LOAD KNOWN STUDENTS
+# LOAD KNOWN FACES
 # ============================================================
 
-def load_known_students():
-    students = {}
+def get_known_face_images():
 
-    if not os.path.exists(KNOWN_FACES_DIR):
-        os.makedirs(KNOWN_FACES_DIR)
+    known_faces = []
 
-        print()
-        print("=" * 70)
-        print("known_faces folder was created.")
-        print("Put student images inside this folder.")
-        print("Example:")
-        print("known_faces/ubaid_khan.jpg")
-        print("=" * 70)
-        print()
+    if not os.path.exists(PICS_DIR):
+        return known_faces
 
-        return students
+    for student_folder in os.listdir(PICS_DIR):
 
-    for filename in os.listdir(KNOWN_FACES_DIR):
-        if filename.lower().endswith((".jpg", ".jpeg", ".png")):
-            image_path = os.path.join(KNOWN_FACES_DIR, filename)
+        student_path = os.path.join(
+            PICS_DIR,
+            student_folder
+        )
 
-            # Check that OpenCV can actually read the image.
-            image = cv2.imread(image_path)
+        if not os.path.isdir(student_path):
+            continue
 
-            if image is None:
-                print(f"WARNING: Could not read image: {image_path}")
-                continue
+        for file_name in os.listdir(student_path):
 
-            student_name = os.path.splitext(filename)[0]
-            student_name = student_name.replace("_", " ")
+            if file_name.lower().endswith(
+                (".jpg", ".jpeg", ".png")
+            ):
 
-            students[student_name] = image_path
+                image_path = os.path.join(
+                    student_path,
+                    file_name
+                )
 
-    return students
+                known_faces.append(
+                    (
+                        student_folder,
+                        image_path
+                    )
+                )
+
+    return known_faces
 
 
 # ============================================================
 # FACE RECOGNITION
 # ============================================================
 
-def recognize_student(face_crop, known_students):
-    """
-    Compare a YOLO-detected person/face crop against each registered
-    student's reference image.
+def match_face_with_deepface(frame):
 
-    Returns:
-        (student_name, distance) if a match is found
-        (None, None) otherwise
-    """
+    known_faces = get_known_face_images()
 
-    if face_crop is None or face_crop.size == 0:
-        return None, None
+    if len(known_faces) == 0:
 
-    best_student = None
-    best_distance = float("inf")
+        print(
+            "[WARNING] No student photos found."
+        )
 
-    for student_name, image_path in known_students.items():
+        print(
+            "[INFO] Example:"
+        )
+
+        print(
+            "known_faces/ubaid/ubaid.jpg"
+        )
+
+        return "Unknown"
+
+
+    print(
+        f"[INFO] Checking {len(known_faces)} "
+        f"known face image(s)..."
+    )
+
+
+    for student_name, image_path in known_faces:
+
         try:
+
             result = DeepFace.verify(
-                img1_path=image_path,
-                img2_path=face_crop,
-                model_name=FACE_MODEL,
-                detector_backend=FACE_DETECTOR,
-                enforce_detection=True,
-                align=True,
-                normalization="base"
+
+                img1_path=frame,
+
+                img2_path=image_path,
+
+                model_name=MODEL_NAME,
+
+                detector_backend=DETECTOR_BACKEND,
+
+                distance_metric=DISTANCE_METRIC,
+
+                enforce_detection=False
+
             )
 
-            distance = float(result.get("distance", float("inf")))
-            verified = bool(result.get("verified", False))
 
-            if verified and distance <= FACE_DISTANCE_THRESHOLD:
-                if distance < best_distance:
-                    best_distance = distance
-                    best_student = student_name
+            distance = result.get(
+                "distance",
+                1.0
+            )
 
-        except Exception as error:
-            # Do not spam the terminal every frame.
-            # A failed comparison simply means this candidate was not
-            # successfully verified.
-            print(f"Recognition warning for {student_name}: {error}")
+            verified = result.get(
+                "verified",
+                False
+            )
 
-    if best_student is not None:
-        return best_student, best_distance
-
-    return None, None
-
-
-# ============================================================
-# DATABASE DISPLAY
-# ============================================================
-
-def print_today_attendance():
-    records = get_today_attendance()
-
-    print()
-    print("=" * 70)
-    print("TODAY'S ATTENDANCE")
-    print("=" * 70)
-
-    if not records:
-        print("No attendance records yet.")
-    else:
-        for record in records:
-            student = record[0]
-            check_in_time = record[2]
-            check_out_time = record[3]
 
             print(
-                f"{student:25} | "
-                f"IN: {check_in_time or '--'} | "
-                f"OUT: {check_out_time or '--'}"
+                f"[FACE CHECK] "
+                f"{student_name} | "
+                f"distance={distance:.4f} | "
+                f"verified={verified}"
             )
 
-    print("=" * 70)
-    print()
+
+            if (
+                verified
+                or
+                distance <= FACE_DISTANCE_THRESHOLD
+            ):
+
+                print(
+                    f"[MATCH FOUND] "
+                    f"{student_name}"
+                )
+
+                return student_name
 
 
-# ============================================================
-# FIND THE BEST YOLO PERSON
-# ============================================================
+        except Exception as error:
 
-def get_largest_person_box(results, frame_width, frame_height):
-    """
-    Select the largest detected person.
-
-    For a classroom attendance station, this makes the system focus
-    on the person closest/largest in front of the camera.
-    """
-
-    best_box = None
-    best_area = 0
-
-    for result in results:
-        if result.boxes is None:
-            continue
-
-        for box in result.boxes:
-            confidence = float(box.conf[0])
-
-            if confidence < YOLO_CONFIDENCE:
-                continue
-
-            x1, y1, x2, y2 = map(
-                int,
-                box.xyxy[0].tolist()
+            print(
+                f"[DEEPFACE ERROR] "
+                f"{student_name}: {error}"
             )
 
-            x1 = max(0, min(x1, frame_width - 1))
-            y1 = max(0, min(y1, frame_height - 1))
-            x2 = max(0, min(x2, frame_width - 1))
-            y2 = max(0, min(y2, frame_height - 1))
 
-            if x2 <= x1 or y2 <= y1:
-                continue
+    print(
+        "[NO MATCH] Unknown student"
+    )
 
-            area = (x2 - x1) * (y2 - y1)
-
-            if area > best_area:
-                best_area = area
-                best_box = (x1, y1, x2, y2, confidence)
-
-    return best_box
+    return "Unknown"
 
 
 # ============================================================
-# CROP PERSON FOR DEEPFACE
+# TKINTER APPLICATION
 # ============================================================
 
-def crop_person(frame, person_box):
-    """
-    Crop the YOLO person box and add a small margin.
+class FaceAttendanceApp:
 
-    DeepFace then searches for the face inside this smaller image
-    instead of processing the entire webcam frame.
-    """
+    def __init__(self, window):
 
-    if person_box is None:
-        return None, None
+        self.window = window
 
-    x1, y1, x2, y2, confidence = person_box
+        self.window.title(
+            "AI School Attendance System"
+        )
 
-    width = x2 - x1
-    height = y2 - y1
-
-    # Add a small margin around the person.
-    margin_x = int(width * 0.08)
-    margin_y = int(height * 0.08)
-
-    x1 = max(0, x1 - margin_x)
-    y1 = max(0, y1 - margin_y)
-    x2 = min(frame.shape[1], x2 + margin_x)
-    y2 = min(frame.shape[0], y2 + margin_y)
-
-    crop = frame[y1:y2, x1:x2].copy()
-
-    return crop, (x1, y1, x2, y2, confidence)
+        self.window.geometry(
+            "1000x750"
+        )
 
 
-# ============================================================
-# MAIN PROGRAM
-# ============================================================
+        # ----------------------------------------------------
+        # APPLICATION VARIABLES
+        # ----------------------------------------------------
 
-def main():
-    print()
-    print("=" * 70)
-    print("              AI FACE ATTENDANCE SYSTEM")
-    print("=" * 70)
-    print()
+        self.cap = cv2.VideoCapture(
+            CAMERA_INDEX
+        )
 
-    # --------------------------------------------------------
-    # Database
-    # --------------------------------------------------------
+        self.current_frame = None
 
-    create_database()
+        self.detected_name = "Unknown"
 
-    # --------------------------------------------------------
-    # Load students
-    # --------------------------------------------------------
+        self.is_processing = False
 
-    known_students = load_known_students()
+        self.last_recognition_time = 0
 
-    if not known_students:
-        print("ERROR: No student images found.")
-        print()
-        print("Put images inside:")
-        print(KNOWN_FACES_DIR)
-        print()
-        print("Example:")
-        print(os.path.join(KNOWN_FACES_DIR, "ubaid_khan.jpg"))
-        return
+        self.last_student = None
 
-    print("Registered students:")
+        self.last_attendance_time = 0
 
-    for student in known_students:
-        print(" -", student)
 
-    print()
+        # ----------------------------------------------------
+        # CAMERA LABEL
+        # ----------------------------------------------------
 
-    # --------------------------------------------------------
-    # Load YOLO11n
-    # --------------------------------------------------------
+        self.cam_label = tk.Label(
+            self.window
+        )
 
-    print("Loading YOLO11n...")
+        self.cam_label.pack(
+            pady=10
+        )
 
-    try:
-        yolo = YOLO(YOLO_MODEL)
-    except Exception as error:
-        print("ERROR: Could not load YOLO11n.")
-        print(error)
-        print()
-        print("Make sure yolo11n.pt exists or that Ultralytics can download it.")
-        return
 
-    print("YOLO11n loaded successfully.")
+        # ----------------------------------------------------
+        # MODE LABEL
+        # ----------------------------------------------------
 
-    # --------------------------------------------------------
-    # Start camera
-    # --------------------------------------------------------
+        self.mode_label = tk.Label(
+            self.window,
+            text=f"MODE: {MODE}",
+            font=("Arial", 18, "bold")
+        )
 
-    camera = cv2.VideoCapture(CAMERA_INDEX)
+        self.mode_label.pack(
+            pady=5
+        )
 
-    if not camera.isOpened():
-        print("ERROR: Could not open camera.")
-        return
 
-    # Request a reasonable webcam resolution.
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        # ----------------------------------------------------
+        # STATUS LABEL
+        # ----------------------------------------------------
 
-    print()
-    print("=" * 70)
-    print("CAMERA STARTED")
-    print("=" * 70)
-    print()
-    print("I = CHECK-IN MODE")
-    print("O = CHECK-OUT MODE")
-    print("A = SHOW TODAY'S ATTENDANCE")
-    print("Q = QUIT")
-    print()
+        self.status_label = tk.Label(
+            self.window,
+            text="Starting camera...",
+            font=("Arial", 16, "bold")
+        )
 
-    # --------------------------------------------------------
-    # Variables
-    # --------------------------------------------------------
+        self.status_label.pack(
+            pady=5
+        )
 
-    mode = "CHECK-IN"
 
-    last_recognition_time = 0
+        # ----------------------------------------------------
+        # RESULT LABEL
+        # ----------------------------------------------------
 
-    last_student = None
-    last_distance = None
+        self.result_label = tk.Label(
+            self.window,
+            text="Student: Unknown",
+            font=("Arial", 20, "bold")
+        )
 
-    status_message = "Ready - face the camera"
-    status_time = time.time()
+        self.result_label.pack(
+            pady=10
+        )
 
-    recognition_cooldown = {}
 
-    # Current YOLO person box
-    current_person_box = None
+        # ----------------------------------------------------
+        # QUIT BUTTON ONLY
+        # ----------------------------------------------------
 
-    # --------------------------------------------------------
-    # Camera loop
-    # --------------------------------------------------------
+        self.quit_button = tk.Button(
+            self.window,
+            text="QUIT",
+            font=("Arial", 12, "bold"),
+            width=12,
+            command=self.quit_app
+        )
 
-    while True:
-        success, frame = camera.read()
+        self.quit_button.pack(
+            pady=10
+        )
 
-        if not success:
-            print("ERROR: Could not read camera.")
-            break
 
-        frame = cv2.flip(frame, 1)
+        # ----------------------------------------------------
+        # START CAMERA
+        # ----------------------------------------------------
+
+        self.update_video()
+
+
+    # ========================================================
+    # VIDEO UPDATE
+    # ========================================================
+
+    def update_video(self):
+
+        ret, frame = self.cap.read()
+
+
+        if ret:
+
+            self.current_frame = frame.copy()
+
+
+            # ------------------------------------------------
+            # FACE DETECTION FOR DISPLAY
+            # ------------------------------------------------
+
+            gray = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2GRAY
+            )
+
+
+            faces = face_cascade.detectMultiScale(
+
+                gray,
+
+                scaleFactor=1.1,
+
+                minNeighbors=5,
+
+                minSize=(80, 80)
+
+            )
+
+
+            # ------------------------------------------------
+            # DRAW FACE BOX
+            # ------------------------------------------------
+
+            for (
+                x,
+                y,
+                w,
+                h
+            ) in faces:
+
+                if self.detected_name != "Unknown":
+
+                    box_color = (
+                        0,
+                        255,
+                        0
+                    )
+
+                else:
+
+                    box_color = (
+                        0,
+                        0,
+                        255
+                    )
+
+
+                cv2.rectangle(
+
+                    frame,
+
+                    (x, y),
+
+                    (x + w, y + h),
+
+                    box_color,
+
+                    2
+
+                )
+
+
+                cv2.putText(
+
+                    frame,
+
+                    self.detected_name,
+
+                    (x, y - 10),
+
+                    cv2.FONT_HERSHEY_SIMPLEX,
+
+                    0.8,
+
+                    box_color,
+
+                    2
+
+                )
+
+
+            # ------------------------------------------------
+            # RECOGNITION TIMER
+            # ------------------------------------------------
+
+            current_time = time.time()
+
+
+            if (
+
+                len(faces) > 0
+
+                and
+
+                not self.is_processing
+
+                and
+
+                (
+                    current_time
+                    -
+                    self.last_recognition_time
+                )
+                >= RECOGNITION_INTERVAL
+
+            ):
+
+                self.is_processing = True
+
+                self.last_recognition_time = current_time
+
+
+                frame_copy = (
+                    self.current_frame.copy()
+                )
+
+
+                threading.Thread(
+
+                    target=self.run_recognition_thread,
+
+                    args=(frame_copy,),
+
+                    daemon=True
+
+                ).start()
+
+
+            # ------------------------------------------------
+            # STATUS
+            # ------------------------------------------------
+
+            self.status_label.config(
+
+                text=(
+                    f"Status: "
+                    f"{self.detected_name}"
+                )
+
+            )
+
+
+            self.result_label.config(
+
+                text=(
+                    f"Student: "
+                    f"{self.detected_name}"
+                )
+
+            )
+
+
+            # ------------------------------------------------
+            # DISPLAY FRAME
+            # ------------------------------------------------
+
+            rgb_frame = cv2.cvtColor(
+
+                frame,
+
+                cv2.COLOR_BGR2RGB
+
+            )
+
+
+            image = Image.fromarray(
+                rgb_frame
+            )
+
+
+            image_tk = ImageTk.PhotoImage(
+                image=image
+            )
+
+
+            self.cam_label.imgtk = image_tk
+
+            self.cam_label.configure(
+                image=image_tk
+            )
+
+
+        self.window.after(
+            20,
+            self.update_video
+        )
+
+
+    # ========================================================
+    # DEEPFACE THREAD
+    # ========================================================
+
+    def run_recognition_thread(
+        self,
+        frame
+    ):
+
+        try:
+
+            name = match_face_with_deepface(
+                frame
+            )
+
+
+            self.detected_name = name
+
+
+            if name != "Unknown":
+
+                self.process_attendance(
+                    name
+                )
+
+
+        except Exception as error:
+
+            print(
+                f"[RECOGNITION ERROR] "
+                f"{error}"
+            )
+
+
+        finally:
+
+            self.is_processing = False
+
+
+    # ========================================================
+    # ATTENDANCE PROCESSING
+    # ========================================================
+
+    def process_attendance(
+        self,
+        student_name
+    ):
 
         current_time = time.time()
 
-        frame_height, frame_width = frame.shape[:2]
 
-        # ====================================================
-        # YOLO11n PERSON DETECTION
-        # ====================================================
+        # ----------------------------------------------------
+        # PREVENT DUPLICATE ATTENDANCE
+        # ----------------------------------------------------
 
-        results = yolo(
-            frame,
-            verbose=False,
-            classes=[0],       # COCO class 0 = person
-            conf=YOLO_CONFIDENCE
-        )
+        if (
 
-        # Draw all person detections.
-        for result in results:
-            if result.boxes is None:
-                continue
+            self.last_student
+            == student_name
 
-            for box in result.boxes:
-                x1, y1, x2, y2 = map(
-                    int,
-                    box.xyxy[0].tolist()
-                )
+            and
 
-                confidence = float(box.conf[0])
+            (
+                current_time
+                -
+                self.last_attendance_time
+            )
+            <
+            COOLDOWN_SECONDS
 
-                x1 = max(0, min(x1, frame_width - 1))
-                y1 = max(0, min(y1, frame_height - 1))
-                x2 = max(0, min(x2, frame_width - 1))
-                y2 = max(0, min(y2, frame_height - 1))
+        ):
 
-                cv2.rectangle(
-                    frame,
-                    (x1, y1),
-                    (x2, y2),
-                    (255, 180, 0),
-                    2
-                )
-
-                cv2.putText(
-                    frame,
-                    f"Person {confidence:.2f}",
-                    (x1, max(20, y1 - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 180, 0),
-                    2
-                )
-
-        # Select the largest person.
-        current_person_box = get_largest_person_box(
-            results,
-            frame_width,
-            frame_height
-        )
-
-        # ====================================================
-        # FACE RECOGNITION
-        # ====================================================
-
-        if current_time - last_recognition_time >= RECOGNITION_INTERVAL:
-            last_recognition_time = current_time
-
-            if current_person_box is None:
-                last_student = "No Person"
-                last_distance = None
-
-            else:
-                person_crop, display_box = crop_person(
-                    frame,
-                    current_person_box
-                )
-
-                try:
-                    student_name, distance = recognize_student(
-                        person_crop,
-                        known_students
-                    )
-
-                    if student_name:
-                        last_student = student_name
-                        last_distance = distance
-
-                        # Draw a stronger box around the recognized person.
-                        x1, y1, x2, y2, confidence = display_box
-
-                        cv2.rectangle(
-                            frame,
-                            (x1, y1),
-                            (x2, y2),
-                            (0, 255, 0),
-                            3
-                        )
-
-                        cv2.putText(
-                            frame,
-                            f"IDENTIFIED: {student_name}",
-                            (x1, max(30, y1 - 15)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.75,
-                            (0, 255, 0),
-                            2
-                        )
-
-                        # ------------------------------------------------
-                        # Prevent repeated database actions
-                        # ------------------------------------------------
-
-                        last_action_time = recognition_cooldown.get(
-                            student_name,
-                            0
-                        )
-
-                        if (
-                            current_time - last_action_time
-                            >= ATTENDANCE_ACTION_COOLDOWN_SECONDS
-                        ):
-                            recognition_cooldown[student_name] = current_time
-
-                            # --------------------------------------------
-                            # CHECK-IN
-                            # --------------------------------------------
-
-                            if mode == "CHECK-IN":
-                                success_action, message = check_in(
-                                    student_name
-                                )
-
-                                status_message = message
-                                status_time = time.time()
-                                print(message)
-
-                            # --------------------------------------------
-                            # CHECK-OUT
-                            # --------------------------------------------
-
-                            elif mode == "CHECK-OUT":
-                                success_action, message = check_out(
-                                    student_name
-                                )
-
-                                status_message = message
-                                status_time = time.time()
-                                print(message)
-
-                    else:
-                        last_student = "Unknown"
-                        last_distance = None
-                        status_message = "Face detected, but student not recognized"
-                        status_time = time.time()
-
-                except Exception as error:
-                    print("Recognition error:", error)
-
-                    last_student = "Recognition Error"
-                    last_distance = None
-                    status_message = "Could not process face"
-                    status_time = time.time()
-
-        # ====================================================
-        # DATE / TIME
-        # ====================================================
-
-        now = datetime.now()
-
-        date_text = now.strftime("%d-%m-%Y")
-        time_text = now.strftime("%I:%M:%S %p")
-
-        # ====================================================
-        # HEADER
-        # ====================================================
-
-        cv2.rectangle(
-            frame,
-            (0, 0),
-            (frame.shape[1], 130),
-            (30, 30, 30),
-            -1
-        )
-
-        cv2.putText(
-            frame,
-            "AI FACE ATTENDANCE SYSTEM",
-            (20, 35),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.85,
-            (255, 255, 255),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"Date: {date_text}",
-            (20, 70),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"Time: {time_text}",
-            (20, 100),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
-            2
-        )
-
-        # ====================================================
-        # MODE
-        # ====================================================
-
-        mode_color = (
-            (0, 255, 0)
-            if mode == "CHECK-IN"
-            else (0, 165, 255)
-        )
-
-        cv2.putText(
-            frame,
-            f"MODE: {mode}",
-            (frame.shape[1] - 260, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            mode_color,
-            2
-        )
-
-        # ====================================================
-        # RECOGNIZED STUDENT
-        # ====================================================
-
-        if last_student:
-            if last_student == "Unknown":
-                student_color = (0, 0, 255)
-            elif last_student in ("No Person", "Recognition Error"):
-                student_color = (0, 255, 255)
-            else:
-                student_color = (0, 255, 0)
-
-            display_text = f"Student: {last_student}"
-
-            if last_distance is not None:
-                display_text += f" | Distance: {last_distance:.3f}"
-
-            cv2.putText(
-                frame,
-                display_text,
-                (20, frame.shape[0] - 100),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                student_color,
-                2
+            print(
+                f"[COOLDOWN] "
+                f"{student_name} already processed."
             )
 
-        # ====================================================
-        # STATUS MESSAGE
-        # ====================================================
+            return
 
-        if time.time() - status_time < 5:
-            cv2.putText(
-                frame,
-                status_message,
-                (20, frame.shape[0] - 65),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 255),
-                2
-            )
 
-        # ====================================================
-        # CONTROLS
-        # ====================================================
+        # ----------------------------------------------------
+        # UPDATE LAST ATTENDANCE
+        # ----------------------------------------------------
 
-        cv2.putText(
-            frame,
-            "I: Check-In | O: Check-Out | A: Attendance | Q: Quit",
-            (20, frame.shape[0] - 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2
+        self.last_student = student_name
+
+        self.last_attendance_time = current_time
+
+
+        # ----------------------------------------------------
+        # ACTION
+        # ----------------------------------------------------
+
+        if MODE.upper() == "ENTRY":
+
+            action = "ENTERED SCHOOL"
+
+        else:
+
+            action = "LEFT SCHOOL"
+
+
+        print(
+            "===================================="
         )
 
-        # ====================================================
-        # SHOW CAMERA
-        # ====================================================
-
-        cv2.imshow(
-            "AI Face Attendance System",
-            frame
+        print(
+            f"[ATTENDANCE] "
+            f"{student_name}"
         )
 
-        # ====================================================
-        # KEYBOARD
-        # ====================================================
+        print(
+            f"[ACTION] "
+            f"{action}"
+        )
 
-        key = cv2.waitKey(1) & 0xFF
+        print(
+            "===================================="
+        )
 
-        if key == ord("i"):
-            mode = "CHECK-IN"
-            status_message = "CHECK-IN MODE"
-            status_time = time.time()
-            print("\nMode changed to CHECK-IN")
 
-        elif key == ord("o"):
-            mode = "CHECK-OUT"
-            status_message = "CHECK-OUT MODE"
-            status_time = time.time()
-            print("\nMode changed to CHECK-OUT")
+        # ----------------------------------------------------
+        # SAVE TO DATABASE
+        # ----------------------------------------------------
 
-        elif key == ord("a"):
-            print_today_attendance()
+        save_attendance(
+            student_name,
+            action
+        )
 
-        elif key == ord("q"):
-            break
+
+        # ----------------------------------------------------
+        # SEND WHATSAPP
+        # ----------------------------------------------------
+
+        send_whatsapp_alert(
+            student_name,
+            action
+        )
+
 
     # ========================================================
-    # CLEANUP
+    # QUIT
     # ========================================================
 
-    camera.release()
-    cv2.destroyAllWindows()
+    def quit_app(self):
 
-    print()
-    print("Camera stopped.")
-    print_today_attendance()
+        print(
+            "[SYSTEM] Closing..."
+        )
+
+
+        if self.cap.isOpened():
+
+            self.cap.release()
+
+
+        self.window.destroy()
 
 
 # ============================================================
-# RUN
+# HAAR CASCADE
+# ============================================================
+
+face_cascade = cv2.CascadeClassifier(
+
+    cv2.data.haarcascades
+    +
+    "haarcascade_frontalface_default.xml"
+
+)
+
+
+# ============================================================
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
-    main()
+
+    print(
+        "========================================"
+    )
+
+    print(
+        " AI SCHOOL ATTENDANCE SYSTEM"
+    )
+
+    print(
+        "========================================"
+    )
+
+    print(
+        f"MODE: {MODE}"
+    )
+
+    print(
+        f"MODEL: {MODEL_NAME}"
+    )
+
+    print(
+        f"THRESHOLD: {FACE_DISTANCE_THRESHOLD}"
+    )
+
+    print(
+        "========================================"
+    )
+
+
+    root = tk.Tk()
+
+
+    app = FaceAttendanceApp(
+        root
+    )
+
+
+    root.mainloop()
